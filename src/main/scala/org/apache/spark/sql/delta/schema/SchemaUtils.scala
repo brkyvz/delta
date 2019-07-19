@@ -440,6 +440,11 @@ object SchemaUtils {
             s"dropping column(s) [${remainingFields.map(_.name).mkString(", ")}]" +
             (if (columnPath.nonEmpty) s" from ${UnresolvedAttribute(columnPath).name}" else ""))
 
+        case (ByteType, ShortType) => ()
+        case (ByteType, IntegerType) => ()
+        case (ShortType, IntegerType) => ()
+        case (NullType, _) => ()
+
         case (fromDataType, toDataType) =>
           verify(fromDataType == toDataType,
             s"changing data type of ${UnresolvedAttribute(columnPath).name} " +

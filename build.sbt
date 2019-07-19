@@ -18,12 +18,17 @@ name := "delta-core"
 
 organization := "io.delta"
 
+version := "0.4.0-SNAPSHOT"
+
 crossScalaVersions := Seq("2.12.8", "2.11.12")
 
 scalaVersion := crossScalaVersions.value.head
 
 resolvers += "Apache Spark snapshot repository" at "https://repository.apache.org/content/repositories/snapshots"
+
 sparkVersion := "3.0.0-SNAPSHOT"
+
+// resolvers += Resolver.mavenLocal
 
 libraryDependencies ++= Seq(
   // Adding test classifier seems to break transitive resolution of the core dependencies

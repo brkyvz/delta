@@ -89,6 +89,7 @@ class OptimisticTransaction
   }
 }
 
+// scalastyle:off
 object OptimisticTransaction {
 
   private val active = new ThreadLocal[OptimisticTransaction]
@@ -184,11 +185,11 @@ trait OptimisticTransactionImpl extends TransactionalWrite {
    * present in the table are still valid under the new metadata.
    */
   def updateMetadata(metadata: Metadata): Unit = {
+    println(s"Updating txn metadata to: $metadata")
     assert(!hasWritten,
       "Cannot update the metadata in a transaction that has already written data.")
     assert(newMetadata.isEmpty,
       "Cannot change the metadata more than once in a transaction.")
-
     val updatedMetadata = if (readVersion == -1) {
       val updatedConfigs = DeltaConfigs.mergeGlobalConfigs(
         spark.sessionState.conf, metadata.configuration, Protocol())
