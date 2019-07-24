@@ -72,8 +72,15 @@ class DeltaDDLSuite extends QueryTest with SharedSQLContext {
     )
   }
 
-  ddlTest("REPLACE TABLE AS SELECT") { tblName =>
+  ddlTest("REPLACE TABLE") { tblName =>
     sql(s"""CREATE OR REPLACE TABLE $tblName (id bigint) USING delta""")
+  }
+
+  ddlTest("REPLACE TABLE AS SELECT") { tblName =>
+    sql(
+      s"""CREATE OR REPLACE TABLE $tblName USING delta AS
+         |SELECT id, id % 5 as part FROM RANGE(10)
+       """.stripMargin)
   }
 
   ddlTest("ALTER TABLE SET TBLPROPERTIES") { tblName =>

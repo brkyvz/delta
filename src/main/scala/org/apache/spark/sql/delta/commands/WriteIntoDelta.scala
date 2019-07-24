@@ -61,15 +61,26 @@ case class WriteIntoDelta(
     options.canOverwriteSchema && isOverwriteOperation && options.replaceWhere.isEmpty
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
-    deltaLog.withNewTransaction { txn =>
-      val actions = write(txn, sparkSession)
+    val txnOpt = OptimisticTransaction.getActive()
+    if (txnOpt.isDefined) {
+      val txn = txnOpt.get
+      val actions = write(txn, sparkSession, update = false)
       val operation = DeltaOperations.Write(mode, Option(partitionColumns), options.replaceWhere)
       txn.commit(actions, operation)
+    } else {
+      deltaLog.withNewTransaction { txn =>
+        val actions = write(txn, sparkSession)
+        val operation = DeltaOperations.Write(mode, Option(partitionColumns), options.replaceWhere)
+        txn.commit(actions, operation)
+      }
     }
     Seq.empty
   }
 
-  def write(txn: OptimisticTransaction, sparkSession: SparkSession): Seq[Action] = {
+  def write(
+      txn: OptimisticTransaction,
+      sparkSession: SparkSession,
+      update: Boolean = true): Seq[Action] = {
     import sparkSession.implicits._
     if (txn.readVersion > -1) {
       // This table already exists, check if the insert is valid.
@@ -81,7 +92,9 @@ case class WriteIntoDelta(
         deltaLog.assertRemovable()
       }
     }
-    updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation)
+    if (update) {
+      updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation)
+    }
 
     // Validate partition predicates
     val replaceWhere = options.replaceWhere
