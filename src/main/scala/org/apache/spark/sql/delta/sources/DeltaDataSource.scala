@@ -37,7 +37,7 @@ import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
-import org.apache.spark.sql.execution.datasources.v2.{V1RelationProvider, V2CatalogCompatibleV1Source}
+import org.apache.spark.sql.delta.catalog.DeltaTableV2
 import org.apache.spark.sql.execution.streaming.{Sink, Source}
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.sources.v2.{Table, TableCapability, TableProvider}
@@ -51,7 +51,7 @@ class DeltaDataSource
   with StreamSourceProvider
   with StreamSinkProvider
   with CreatableRelationProvider
-  with V2CatalogCompatibleV1Source
+  with TableProvider
   with DataSourceRegister
   with DeltaLogging {
 
@@ -59,6 +59,11 @@ class DeltaDataSource
     // Enable "passPartitionByAsOptions" to support "write.partitionBy(...)"
     // TODO Remove this when upgrading to Spark 3.0.0
     spark.conf.set("spark.sql.legacy.sources.write.passPartitionByAsOptions", "true")
+  }
+
+  override def getTable(options: CaseInsensitiveStringMap): Table = {
+    Option(options.get("path")).map(DeltaTableV2(_)).getOrElse(
+      throw new IllegalArgumentException("Path not provided."))
   }
 
   override def sourceSchema(
@@ -212,7 +217,8 @@ class DeltaDataSource
       Nil
     }
 
-    deltaLog.createRelation(partitionFilters, timeTravelByParams.orElse(timeTravelByPath))
+    deltaLog.createRelation(
+      partitionFilters, timeTravelByParams.orElse(timeTravelByPath), parameters)
   }
 
   override def shortName(): String = {

@@ -43,7 +43,6 @@ class DeltaDDLSuite extends QueryTest with SharedSQLContext {
       withTable(tblName) {
         f(tblName)
 
-        sql(s"DESCRIBE EXTENDED $tblName").show()
         val table = getTable(tblName)
         assert(table.schema.isEmpty)
         val props = new java.util.HashMap[String, String](table.properties.asJava)
@@ -77,11 +76,13 @@ class DeltaDDLSuite extends QueryTest with SharedSQLContext {
   ddlTest("ALTER TABLE SET TBLPROPERTIES") { tblName =>
     sql(s"""CREATE TABLE $tblName (id bigint) USING delta""")
     sql(s"""ALTER TABLE $tblName SET TBLPROPERTIES (delta.appendOnly = true)""")
+    val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
   }
 
   ddlTest("ALTER TABLE UNSET TBLPROPERTIES") { tblName =>
     sql(s"CREATE TABLE $tblName (id bigint) USING delta TBLPROPERTIES (delta.appendOnly = true)")
     sql(s"""ALTER TABLE $tblName UNSET TBLPROPERTIES (delta.appendOnly)""")
+    val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
   }
 
   ddlTest("ALTER TABLE ADD COLUMN") { tblName =>

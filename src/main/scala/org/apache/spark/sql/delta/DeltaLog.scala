@@ -601,7 +601,8 @@ class DeltaLog private(
    */
   def createRelation(
       partitionFilters: Seq[Expression] = Nil,
-      timeTravel: Option[DeltaTimeTravelSpec] = None): BaseRelation = {
+      timeTravel: Option[DeltaTimeTravelSpec] = None,
+      parameters: Map[String, String] = Map.empty): BaseRelation = {
 
     val versionToUse = timeTravel.map { tt =>
       val (version, accessType) = DeltaTableUtils.resolveTimeTravelVersion(
@@ -631,7 +632,7 @@ class DeltaLog private(
         WriteIntoDelta(
           deltaLog = DeltaLog.this,
           mode = mode,
-          new DeltaOptions(Map.empty[String, String], spark.sessionState.conf),
+          new DeltaOptions(parameters, spark.sessionState.conf),
           partitionColumns = Seq.empty,
           configuration = Map.empty,
           data = data).run(spark)

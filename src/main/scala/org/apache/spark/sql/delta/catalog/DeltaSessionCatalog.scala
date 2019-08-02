@@ -23,33 +23,32 @@ import java.util.Locale
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.commons.io.FileSystemUtils
 import org.apache.hadoop.fs.Path
-import org.apache.hadoop.io.IOUtils
 
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalog.v2.TableChange._
 import org.apache.spark.sql.catalog.v2.{Identifier, StagingTableCatalog, TableChange}
 import org.apache.spark.sql.catalog.v2.expressions.{FieldReference, IdentityTransform, Transform}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogUtils}
+import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.delta.DeltaOperations.QualifiedColTypeWithPositionForLog
-import org.apache.spark.sql.delta.{DeltaErrors, DeltaLog, DeltaOperations, OptimisticTransaction}
+import org.apache.spark.sql.delta.{DeltaConfigs, DeltaErrors, DeltaLog, DeltaOperations, OptimisticTransaction}
 import org.apache.spark.sql.delta.actions.Metadata
 import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.DeltaDataSource
 import org.apache.spark.sql.delta.util.DeltaFileOperations
 import org.apache.spark.sql.execution.datasources.DataSource
-import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, V1RelationProvider, V2SessionCatalog}
+import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, V2SessionCatalog}
 import org.apache.spark.sql.internal.SessionState
-import org.apache.spark.sql.sources.CreatableRelationProvider
+import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceV1Table, DataSourceV1TableCatalog}
 import org.apache.spark.sql.sources.v2.{StagedTable, Table, TableCapability}
 import org.apache.spark.sql.types.{DataType, MetadataBuilder, StructField, StructType}
 import org.apache.spark.util.Utils
 
 // scalastyle:off
 class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(sessionState)
-  with StagingTableCatalog {
+  with StagingTableCatalog
+  with DataSourceV1TableCatalog {
 
   def this() = this(SparkSession.active.sessionState)
 
@@ -68,10 +67,31 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
   override def loadTable(ident: Identifier): Table = {
     val catalogTable = super.loadTable(ident).asInstanceOf[CatalogTableAsV2]
     if (isDeltaTable(catalogTable)) {
-      return DeltaTableV2(catalogTable.v1Table)
+      return DeltaTableV2(catalogTable.v1Table.location.toString)
     }
 
     catalogTable
+  }
+
+  private def createCatalogTable(
+      ident: Identifier,
+      properties: Map[String, String]): CatalogTable = {
+    val location = properties.get("location")
+    val storage = DataSource.buildStorageFormatFromOptions(properties)
+      .copy(locationUri = location.map(CatalogUtils.stringToURI))
+    val tableType = if (location.isDefined) CatalogTableType.EXTERNAL else CatalogTableType.MANAGED
+
+    CatalogTable(
+      identifier = ident.asTableIdentifier,
+      tableType = tableType,
+      storage = storage,
+      schema = new StructType(),
+      provider = Some("delta"),
+      partitionColumnNames = Nil,
+      bucketSpec = None,
+      properties = properties,
+      tracksPartitionsInCatalog = false,
+      comment = properties.get("comment"))
   }
 
   override def createTable(
@@ -86,19 +106,22 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
 
       val deltaLog = DeltaLog.forTable(SparkSession.active, new Path(location))
 
-      val txn = deltaLog.startTransaction()
-      if (txn.readVersion > -1) {
-        throw new IllegalArgumentException(s"A Delta table already exists at $location")
-      }
       val props = getMetaStoreProperties(properties)
+      val txn = deltaLog.startTransaction()
+      if (txn.readVersion == -1) {
+        txn.commit(
+          metadata :: Nil,
+          DeltaOperations.CreateTable(metadata, !properties.containsKey("location")))
+      } else {
+        verifyTableMetadata(txn, metadata.schema, metadata.partitionColumns, metadata.configuration)
+      }
 
-      val created = super.createTable(ident, new StructType(), Array.empty, props)
+      sessionState.catalog.createTable(
+        createCatalogTable(ident, props.asScala.toMap),
+        ignoreIfExists = false,
+        validateLocation = false)
 
-      txn.commit(
-        metadata :: Nil,
-        DeltaOperations.CreateTable(metadata, !properties.containsKey("location")))
-
-      created
+      DeltaTableV2(location.toString)
     } else {
       super.createTable(ident, schema, partitions, properties)
     }
@@ -221,13 +244,17 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       partitions: Array[Transform],
       properties: ju.Map[String, String]): StagedTable = {
     if (!isDeltaTable(properties)) {
-      throw new IllegalArgumentException("")
+      throw new IllegalArgumentException(s"Not a Delta table: $properties")
     }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
     val location = getLocation(ident, properties)
     val props = getMetaStoreProperties(properties)
-    val table = super.createTable(ident, new StructType(), Array.empty, props)
-    StagedDeltaTable(table, SparkSession.active, location, metadata, clearLocationIfFailed = true)
+    val commitOp = () => sessionState.catalog.createTable(
+      createCatalogTable(ident, props.asScala.toMap),
+      ignoreIfExists = false,
+      validateLocation = false)
+    StagedDeltaTable(
+      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = true)
   }
 
   override def stageReplace(
@@ -236,13 +263,36 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       partitions: Array[Transform],
       properties: ju.Map[String, String]): StagedTable = {
     if (!isDeltaTable(properties)) {
-      throw new IllegalArgumentException("")
+      throw new IllegalArgumentException(s"Not a Delta table: $properties")
     }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
     val location = getLocation(ident, properties)
     val props = getMetaStoreProperties(properties)
-    val table = super.createTable(ident, new StructType(), Array.empty, props)
-    StagedDeltaTable(table, SparkSession.active, location, metadata, clearLocationIfFailed = false)
+    val commitOp = () => sessionState.catalog.createTable(
+      createCatalogTable(ident, props.asScala.toMap),
+      ignoreIfExists = false,
+      validateLocation = false)
+    StagedDeltaTable(
+      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = false)
+  }
+
+  override def stageCreateOrReplace(
+      ident: Identifier,
+      schema: StructType,
+      partitions: Array[Transform],
+      properties: ju.Map[String, String]): StagedTable = {
+    if (!isDeltaTable(properties)) {
+      throw new IllegalArgumentException(s"Not a Delta table: $properties")
+    }
+    val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
+    val location = getLocation(ident, properties)
+    val props = getMetaStoreProperties(properties)
+    val commitOp = () => sessionState.catalog.createTable(
+      createCatalogTable(ident, props.asScala.toMap),
+      ignoreIfExists = false,
+      validateLocation = false)
+    StagedDeltaTable(
+      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = false)
   }
 
   private def setupMetadata(
@@ -258,13 +308,14 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
 
     val storageProps = Set("location", "comment", "provider")
     val tableProperties = properties.asScala.filterKeys(p => !storageProps.contains(p))
+    val validatedConfigurations = DeltaConfigs.validateConfigurations(tableProperties.toMap)
 
     Metadata(
       name = ident.name(),
       schemaString = schema.json,
       partitionColumns = partitionColumns,
       description = properties.get("comment"),
-      configuration = tableProperties.toMap
+      configuration = validatedConfigurations
     )
   }
 
@@ -283,6 +334,68 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       }
     }
     newProps
+  }
+
+  /**
+   * Verify against our transaction metadata that the user specified the right metadata for the
+   * table.
+   */
+  private def verifyTableMetadata(
+      txn: OptimisticTransaction,
+      schema: StructType,
+      partitionColumnNames: Seq[String],
+      properties: Map[String, String]): Unit = {
+    val existingMetadata = txn.metadata
+    val path = txn.deltaLog.dataPath
+
+    // The delta log already exists. If they give any configuration, we'll make sure it all matches.
+    // Otherwise we'll just go with the metadata already present in the log.
+    // The schema compatibility checks will be made in `WriteIntoDelta` for CreateTable
+    // with a query
+    if (txn.readVersion > -1) {
+      if (schema.nonEmpty && schema != existingMetadata.schema) {
+        // We check exact alignment on create table if everything is provided
+        throw new AnalysisException(
+          s"""
+             |The specified schema does not match the existing schema at $path.
+             |
+             |== Specified ==
+             |${schema.treeString}
+             |
+             |== Existing ==
+             |${existingMetadata.schema.treeString}
+             """.stripMargin)
+      }
+
+      // If schema is specified, we must make sure the partitioning matches, even the partitioning
+      // is not specified.
+      if (schema.nonEmpty &&
+        partitionColumnNames != existingMetadata.partitionColumns) {
+        throw new AnalysisException(
+          s"""
+             |The specified partitioning does not match the existing partitioning at $path.
+             |
+             |== Specified ==
+             |${partitionColumnNames.mkString(", ")}
+             |
+             |== Existing ==
+             |${existingMetadata.partitionColumns.mkString(", ")}
+             """.stripMargin)
+      }
+
+      if (properties.nonEmpty && properties != existingMetadata.configuration) {
+        throw new AnalysisException(
+          s"""
+             |The specified properties do not match the existing properties at $path.
+             |
+             |== Specified ==
+             |${properties.map { case (k, v) => s"$k=$v" }.mkString("\n")}
+             |
+             |== Existing ==
+             |${existingMetadata.configuration.map { case (k, v) => s"$k=$v" }.mkString("\n")}
+             """.stripMargin)
+      }
+    }
   }
 }
 
@@ -304,32 +417,40 @@ trait DeltaV2TableMixin extends Table {
     metadata.configuration.asJava
   }
 
-  override def capabilities(): ju.Set[TableCapability] = new ju.HashSet[TableCapability]()
+  override def capabilities(): ju.Set[TableCapability] =
+    new ju.HashSet[TableCapability](ju.Collections.singleton(TableCapability.ACCEPT_ANY_SCHEMA))
 }
 
-case class DeltaTableV2(v1Table: CatalogTable) extends V1RelationProvider with DeltaV2TableMixin {
+case class DeltaTableV2(location: String) extends DataSourceV1Table with DeltaV2TableMixin {
 
-  override val relation: CreatableRelationProvider = new DeltaDataSource()
+  private lazy val spark: SparkSession = SparkSession.active
 
-  override private[catalog] val deltaLog: DeltaLog = DeltaLog.forTable(SparkSession.active, v1Table)
+  override val v1Relation: BaseRelation =
+    new DeltaDataSource().createRelation(spark.sqlContext, Map("path" -> location))
+
+  override private[catalog] val deltaLog: DeltaLog = DeltaLog.forTable(spark, location)
 
   override protected val metadata: Metadata = deltaLog.update().metadata
 }
 
 case class StagedDeltaTable private (
-    v1Table: CatalogTable,
     deltaLog: DeltaLog,
+    commitOperation: () => Unit,
     abortOperation: () => Unit) extends StagedTable
   with DeltaV2TableMixin
-  with V1RelationProvider {
+  with DataSourceV1Table {
 
-  override val relation: CreatableRelationProvider = new DeltaDataSource()
+  private lazy val spark: SparkSession = SparkSession.active
+
+  override lazy val v1Relation: BaseRelation = new DeltaDataSource().createRelation(
+    spark.sqlContext, Map("path" -> deltaLog.dataPath.toString))
 
   override protected val metadata: Metadata = OptimisticTransaction.getActive().get.metadata
 
   override def commitStagedChanges(): Unit = {
     assert(OptimisticTransaction.getActive().isDefined)
     OptimisticTransaction.clearActive()
+    commitOperation()
   }
 
   override def abortStagedChanges(): Unit = {
@@ -341,10 +462,10 @@ case class StagedDeltaTable private (
 
 object StagedDeltaTable {
   def apply(
-      table: Table,
       spark: SparkSession,
       location: URI,
       metadata: Metadata,
+      commitOperation: () => Unit,
       clearLocationIfFailed: Boolean): StagedDeltaTable = {
     val deltaLog = DeltaLog.forTable(spark, new Path(location))
     val txn = deltaLog.startTransaction()
@@ -357,6 +478,6 @@ object StagedDeltaTable {
       }
     }
 
-    new StagedDeltaTable(table.asInstanceOf[DeltaTableV2].v1Table, deltaLog, abort)
+    new StagedDeltaTable(deltaLog, commitOperation, abort)
   }
 }
