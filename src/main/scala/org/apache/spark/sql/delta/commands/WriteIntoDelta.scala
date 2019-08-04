@@ -92,6 +92,7 @@ case class WriteIntoDelta(
         deltaLog.assertRemovable()
       }
     }
+    // scalastyle:off
     if (updateMD) {
       updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation)
     }

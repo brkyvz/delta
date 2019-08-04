@@ -46,7 +46,7 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /** A DataSource V1 for integrating Delta into Spark SQL batch and Streaming APIs. */
-class DeltaDataSource
+trait DeltaDataSourceBase
   extends RelationProvider
   with StreamSourceProvider
   with StreamSinkProvider
@@ -248,6 +248,8 @@ class DeltaDataSource
     }
   }
 }
+
+class DeltaDataSource extends DeltaDataSourceBase
 
 object DeltaDataSource {
   private implicit val formats = Serialization.formats(NoTypeHints)

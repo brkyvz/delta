@@ -24,36 +24,62 @@ import java.net.URI
 import java.util.Locale
 
 import scala.collection.JavaConverters._
+import scala.util.Try
 
+import io.delta.DeltaExtensions
 import org.apache.hadoop.fs.Path
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.sql.catalog.v2.{Identifier, TableCatalog}
-import org.apache.spark.{SparkEnv, SparkException}
-import org.apache.spark.sql.{AnalysisException, QueryTest, Row, SaveMode}
+import org.apache.spark.{SparkConf, SparkEnv, SparkException}
+import org.apache.spark.sql.{AnalysisException, QueryTest, Row, SaveMode, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.catalog.{CatalogTableType, CatalogUtils, ExternalCatalogUtils}
 import org.apache.spark.sql.delta.DeltaOperations.ManualUpdate
 import org.apache.spark.sql.delta.actions.Metadata
+import org.apache.spark.sql.delta.analysis.DeltaAnalysis
 import org.apache.spark.sql.delta.catalog.{DeltaSessionCatalog, DeltaTableV2}
 import org.apache.spark.sql.delta.schema.InvariantViolationException
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.v2.Table
-import org.apache.spark.sql.test.{SQLTestUtils, SharedSQLContext}
+import org.apache.spark.sql.test.{SQLTestUtils, SharedSQLContext, TestSparkSession}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
-class DeltaDDLSuite2 extends DeltaDDLTestBase with DeltaSaveAsTableSuite with SharedSQLContext
+class DeltaDDLSuite2 extends DeltaDDLTestBase
 
-abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeAndAfter {
-  import testImplicits._
+abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with BeforeAndAfter {
 
-  before {
-    spark.conf.set("spark.sql.catalog.session", classOf[DeltaSessionCatalog].getName)
-    spark.conf.set("spark.databricks.delta.snapshotPartitions", 1)
+  override def sparkConf: SparkConf = {
+    super.sparkConf
+      .set("spark.sql.catalog.session", classOf[DeltaSessionCatalog].getName)
+      .set("spark.databricks.delta.snapshotPartitions", "1")
+      .set("spark.sql.extensions", classOf[DeltaExtensions].getName)
   }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    OptimisticTransaction.clearActive()
+    Try {
+      spark.sessionState.catalog.listTables("default").foreach { ti =>
+        spark.sessionState.catalog.dropTable(ti, ignoreIfNotExists = true, purge = true)
+      }
+    }
+  }
+
+  override def withTable(tableNames: String*)(f: => Unit): Unit = {
+    try f finally {
+      tableNames.foreach { t =>
+        Try(getSessionCatalog.dropTable(Identifier.of(Array.empty, t)))
+        Try(spark.sessionState.catalog.dropTable(
+          TableIdentifier(t), ignoreIfNotExists = true, purge = true))
+      }
+    }
+  }
+
+  import testImplicits._
 
   private def disableSparkService[A](f: => A): A = f
 
@@ -68,7 +94,7 @@ abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeA
   }
 
   private implicit class DeltaTable(table: Table) {
-    def location: URI = new URI(table.asInstanceOf[DeltaTableV2].location)
+    def location: URI = new Path(table.asInstanceOf[DeltaTableV2].location).toUri
 
     def partitionColumnNames: Seq[String] = table.partitioning()
       .flatMap(_.references().map(_.fieldNames().mkString("."))).toSeq
@@ -1132,9 +1158,9 @@ abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeA
           assert(table.location == makeQualifiedPath(loc.getAbsolutePath))
           assert(new Path(table.location).toString.contains(specialChars))
 
-          assert(loc.listFiles().forall(_.toString.contains("_delta_log")))
+          assert(loc.listFiles().forall(_.toString.contains("_delta_log")), loc.listFiles().toSeq)
           spark.sql("INSERT INTO TABLE t SELECT 1")
-          assert(!loc.listFiles().forall(_.toString.contains("_delta_log")))
+          assert(!loc.listFiles().forall(_.toString.contains("_delta_log")), loc.listFiles().toSeq)
           checkAnswer(spark.table("t"), Row("1") :: Nil)
         }
 
@@ -1222,6 +1248,7 @@ abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeA
           "TBLPROPERTIES('delta.randomizeFilePrefixes' = 'true') " +
           s"LOCATION '${path.getAbsolutePath}'")
         sql("INSERT INTO src SELECT 1, 'a'")
+        checkAnswer(spark.table("src"), Row(1, "a"))
 
         // CREATE TABLE without specifying anything works
         sql(s"CREATE TABLE t1 USING delta LOCATION '${path.getAbsolutePath}'")
@@ -1233,7 +1260,8 @@ abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeA
         checkAnswer(spark.table("t2"), Row(1, "a"))
         // Table properties should not be changed to empty.
         val tableMetadata = getTableMetadata(TableIdentifier("t2"))
-        assert(tableMetadata.properties == Map("delta.randomizeFilePrefixes" -> "true"))
+        assert(tableMetadata.properties.asScala.toMap ===
+          Map("delta.randomizeFilePrefixes" -> "true"))
 
         // CREATE TABLE with the same schema but no partitioning fails.
         val e0 = intercept[AnalysisException] {
@@ -1331,11 +1359,7 @@ abstract class DeltaDDLTestBase extends QueryTest with SQLTestUtils with BeforeA
     }
   }
   */
-}
 
-trait DeltaSaveAsTableSuite extends QueryTest with SharedSQLContext {
-
-  import testImplicits._
   val format = "delta"
 
   test("saveAsTable (append) to a table created without a schema") {

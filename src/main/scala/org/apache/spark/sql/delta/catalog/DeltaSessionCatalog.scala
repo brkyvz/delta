@@ -22,10 +22,11 @@ import java.util.Locale
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
 
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileSystem, Path}
 
-import org.apache.spark.sql.{AnalysisException, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, SQLContext, SaveMode, SparkSession}
 import org.apache.spark.sql.catalog.v2.TableChange._
 import org.apache.spark.sql.catalog.v2.{Identifier, StagingTableCatalog, TableChange}
 import org.apache.spark.sql.catalog.v2.expressions.{FieldReference, IdentityTransform, Transform}
@@ -35,20 +36,21 @@ import org.apache.spark.sql.delta.DeltaOperations.QualifiedColTypeWithPositionFo
 import org.apache.spark.sql.delta.{DeltaConfigs, DeltaErrors, DeltaLog, DeltaOperations, OptimisticTransaction}
 import org.apache.spark.sql.delta.actions.Metadata
 import org.apache.spark.sql.delta.schema.SchemaUtils
-import org.apache.spark.sql.delta.sources.DeltaDataSource
+import org.apache.spark.sql.delta.sources.{DeltaDataSource, DeltaDataSourceBase}
 import org.apache.spark.sql.delta.util.DeltaFileOperations
 import org.apache.spark.sql.execution.datasources.DataSource
-import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, V2SessionCatalog}
+import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, SupportsV1Write, V2SessionCatalog}
 import org.apache.spark.sql.internal.SessionState
-import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, DataSourceV1Table, DataSourceV1TableCatalog}
-import org.apache.spark.sql.sources.v2.{StagedTable, Table, TableCapability}
+import org.apache.spark.sql.sources.v2.writer.{V1WriteBuilder, WriteBuilder}
+import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider}
+import org.apache.spark.sql.sources.v2.{StagedTable, SupportsWrite, Table, TableCapability}
 import org.apache.spark.sql.types.{DataType, MetadataBuilder, StructField, StructType}
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.util.Utils
 
 // scalastyle:off
 class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(sessionState)
-  with StagingTableCatalog
-  with DataSourceV1TableCatalog {
+  with StagingTableCatalog {
 
   def this() = this(SparkSession.active.sessionState)
 
@@ -67,7 +69,7 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
   override def loadTable(ident: Identifier): Table = {
     val catalogTable = super.loadTable(ident).asInstanceOf[CatalogTableAsV2]
     if (isDeltaTable(catalogTable)) {
-      return DeltaTableV2(catalogTable.v1Table.location.toString)
+      return DeltaTableV2(new Path(catalogTable.v1Table.location).toString)
     }
 
     catalogTable
@@ -103,12 +105,28 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
     if (isDeltaTable(properties)) {
       val metadata = setupMetadata(ident, schema, partitions, properties)
       val location = getLocation(ident, properties)
-
       val deltaLog = DeltaLog.forTable(SparkSession.active, new Path(location))
 
       val props = getMetaStoreProperties(properties)
       val txn = deltaLog.startTransaction()
-      if (txn.readVersion == -1) {
+      val tableLocation = new Path(location)
+      val fs = tableLocation.getFileSystem(sessionState.newHadoopConf())
+      val isManagedTable = !properties.containsKey("location")
+      val sparkSession = SparkSession.active
+
+      if (isManagedTable) {
+        // When creating a managed table, the table path should not exist or is empty, or
+        // users would be surprised to see the data, or see the data directory being dropped
+        // after the table is dropped.
+        assertPathEmpty(sparkSession, ident, tableLocation)
+      }
+
+      val noExistingMetadata = txn.readVersion == -1 || txn.metadata.schema.isEmpty
+      if (noExistingMetadata) {
+        assertTableSchemaDefined(
+          fs, tableLocation, metadata.schema, isManagedTable, ident, sparkSession)
+        assertPathEmpty(sparkSession, ident, tableLocation)
+
         txn.commit(
           metadata :: Nil,
           DeltaOperations.CreateTable(metadata, !properties.containsKey("location")))
@@ -303,7 +321,7 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
     val partitionColumns = partitions.map {
       case IdentityTransform(FieldReference(Seq(col))) => col
       case t =>
-        throw new UnsupportedOperationException(s"Unsupported partitioning transform: $t")
+        throw new AnalysisException(s"Unsupported partitioning transform: $t")
     }
 
     val storageProps = Set("location", "comment", "provider")
@@ -397,14 +415,52 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       }
     }
   }
+
+  private def assertPathEmpty(
+      sparkSession: SparkSession,
+      identifier: Identifier,
+      path: Path): Unit = {
+    val fs = path.getFileSystem(sparkSession.sessionState.newHadoopConf())
+    // Verify that the table location associated with CREATE TABLE doesn't have any data. Note that
+    // we intentionally diverge from this behavior w.r.t regular datasource tables (that silently
+    // overwrite any previous data)
+    if (fs.exists(path) && fs.listStatus(path).nonEmpty) {
+      throw new AnalysisException(s"Cannot create table ('$identifier')." +
+        s" The associated location ('$path') is not empty.")
+    }
+  }
+
+  private def assertTableSchemaDefined(
+      fs: FileSystem,
+      path: Path,
+      schema: StructType,
+      isManaged: Boolean,
+      identifier: Identifier,
+      sparkSession: SparkSession): Unit = {
+    // Users did not specify the schema. We expect the schema exists in Delta.
+    if (schema.isEmpty) {
+      if (!isManaged) {
+        if (fs.exists(path) && fs.listStatus(path).nonEmpty) {
+          throw DeltaErrors.createExternalTableWithoutLogException(
+            path, identifier.toString, sparkSession)
+        } else {
+          throw DeltaErrors.createExternalTableWithoutSchemaException(
+            path, identifier.toString, sparkSession)
+        }
+      } else {
+        throw DeltaErrors.createManagedTableWithoutSchemaException(
+          identifier.toString, sparkSession)
+      }
+    }
+  }
 }
 
-trait DeltaV2TableMixin extends Table {
+trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrite {
   private[catalog] val deltaLog: DeltaLog
 
   protected val metadata: Metadata
 
-  override def name(): String = "Delta Lake"
+  override def name(): String = s"Delta Lake[${deltaLog.dataPath}]"
 
   override def schema(): StructType = metadata.schema
 
@@ -417,16 +473,38 @@ trait DeltaV2TableMixin extends Table {
     metadata.configuration.asJava
   }
 
-  override def capabilities(): ju.Set[TableCapability] =
-    new ju.HashSet[TableCapability](ju.Collections.singleton(TableCapability.ACCEPT_ANY_SCHEMA))
+  override def capabilities(): ju.Set[TableCapability] = new ju.HashSet[TableCapability](Set(
+    TableCapability.BATCH_WRITE,
+    TableCapability.ACCEPT_ANY_SCHEMA
+  ).asJava)
+
+  override def createRelation(
+      sqlContext: SQLContext,
+      parameters: Map[String, String]): BaseRelation = {
+    super.createRelation(sqlContext, parameters + ("path" -> deltaLog.dataPath.toString))
+  }
+
+  override def createRelation(
+      sqlContext: SQLContext,
+      mode: SaveMode,
+      parameters: Map[String, String],
+      data: DataFrame): BaseRelation = {
+    super.createRelation(
+      sqlContext, mode, parameters + ("path" -> deltaLog.dataPath.toString), data)
+  }
+
+  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder = {
+    new DeltaWriteBuilder(this)
+  }
 }
 
-case class DeltaTableV2(location: String) extends DataSourceV1Table with DeltaV2TableMixin {
+class DeltaWriteBuilder(table: DeltaV2TableMixin) extends V1WriteBuilder {
+  override def buildForV1Write(): CreatableRelationProvider = table
+}
+
+case class DeltaTableV2(location: String) extends DeltaV2TableMixin {
 
   private lazy val spark: SparkSession = SparkSession.active
-
-  override val v1Relation: BaseRelation =
-    new DeltaDataSource().createRelation(spark.sqlContext, Map("path" -> location))
 
   override private[catalog] val deltaLog: DeltaLog = DeltaLog.forTable(spark, location)
 
@@ -437,13 +515,9 @@ case class StagedDeltaTable private (
     deltaLog: DeltaLog,
     commitOperation: () => Unit,
     abortOperation: () => Unit) extends StagedTable
-  with DeltaV2TableMixin
-  with DataSourceV1Table {
+  with DeltaV2TableMixin {
 
   private lazy val spark: SparkSession = SparkSession.active
-
-  override lazy val v1Relation: BaseRelation = new DeltaDataSource().createRelation(
-    spark.sqlContext, Map("path" -> deltaLog.dataPath.toString))
 
   override protected val metadata: Metadata = OptimisticTransaction.getActive().get.metadata
 
@@ -469,6 +543,7 @@ object StagedDeltaTable {
       clearLocationIfFailed: Boolean): StagedDeltaTable = {
     val deltaLog = DeltaLog.forTable(spark, new Path(location))
     val txn = deltaLog.startTransaction()
+    assert(OptimisticTransaction.getActive().isEmpty, "There's already an active transaction!")
     OptimisticTransaction.setActive(txn)
     txn.updateMetadata(metadata)
 
@@ -478,6 +553,12 @@ object StagedDeltaTable {
       }
     }
 
-    new StagedDeltaTable(deltaLog, commitOperation, abort)
+    try {
+      new StagedDeltaTable(deltaLog, commitOperation, abort)
+    } catch {
+      case NonFatal(e) =>
+        OptimisticTransaction.clearActive()
+        throw e
+    }
   }
 }
