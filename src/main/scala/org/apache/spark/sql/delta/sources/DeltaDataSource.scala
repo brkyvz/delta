@@ -142,8 +142,7 @@ trait DeltaDataSourceBase
       mode = mode,
       new DeltaOptions(parameters, sqlContext.sparkSession.sessionState.conf),
       partitionColumns = partitionColumns,
-      configuration = Map.empty,
-      data = data).run(sqlContext.sparkSession)
+      configuration = Map.empty).run(sqlContext.sparkSession, data)
 
     deltaLog.createRelation()
   }

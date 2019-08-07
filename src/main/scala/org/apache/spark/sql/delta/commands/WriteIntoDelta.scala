@@ -18,11 +18,12 @@ package org.apache.spark.sql.delta.commands
 
 // scalastyle:off import.ordering.noEmptyLine
 import org.apache.spark.sql.delta._
-import org.apache.spark.sql.delta.actions.{Action, AddFile}
+import org.apache.spark.sql.delta.actions.{Action, AddFile, RemoveFile}
 import org.apache.spark.sql.delta.schema.ImplicitMetadataOperation
-
 import org.apache.spark.sql._
 import org.apache.spark.sql.execution.command.RunnableCommand
+import org.apache.spark.sql.sources.{Filter, InsertableRelation}
+import org.apache.spark.sql.sources.v2.writer.{SupportsOverwrite, SupportsTruncate, V1WriteBuilder, WriteBuilder}
 
 /**
  * Used to write a [[DataFrame]] into a delta table.
@@ -47,10 +48,8 @@ case class WriteIntoDelta(
     mode: SaveMode,
     options: DeltaOptions,
     partitionColumns: Seq[String],
-    configuration: Map[String, String],
-    data: DataFrame)
-  extends RunnableCommand
-  with ImplicitMetadataOperation
+    configuration: Map[String, String])
+  extends ImplicitMetadataOperation
   with DeltaCommand {
 
   override protected val canMergeSchema: Boolean = options.canMergeSchema
@@ -60,19 +59,11 @@ case class WriteIntoDelta(
   override protected val canOverwriteSchema: Boolean =
     options.canOverwriteSchema && isOverwriteOperation && options.replaceWhere.isEmpty
 
-  override def run(sparkSession: SparkSession): Seq[Row] = {
-    val txnOpt = OptimisticTransaction.getActive()
-    if (txnOpt.isDefined) {
-      val txn = txnOpt.get
-      val actions = write(txn, sparkSession, updateMD = false)
+  def run(sparkSession: SparkSession, data: DataFrame): Seq[Row] = {
+    deltaLog.withNewTransaction { txn =>
+      val actions = write(txn, sparkSession, data: DataFrame)
       val operation = DeltaOperations.Write(mode, Option(partitionColumns), options.replaceWhere)
       txn.commit(actions, operation)
-    } else {
-      deltaLog.withNewTransaction { txn =>
-        val actions = write(txn, sparkSession)
-        val operation = DeltaOperations.Write(mode, Option(partitionColumns), options.replaceWhere)
-        txn.commit(actions, operation)
-      }
     }
     Seq.empty
   }
@@ -80,7 +71,7 @@ case class WriteIntoDelta(
   def write(
       txn: OptimisticTransaction,
       sparkSession: SparkSession,
-      updateMD: Boolean = true): Seq[Action] = {
+      data: DataFrame): Seq[Action] = {
     import sparkSession.implicits._
     if (txn.readVersion > -1) {
       // This table already exists, check if the insert is valid.
@@ -92,10 +83,8 @@ case class WriteIntoDelta(
         deltaLog.assertRemovable()
       }
     }
-    // scalastyle:off
-    if (updateMD) {
-      updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation)
-    }
+
+    updateMetadata(txn, data, partitionColumns, configuration, isOverwriteOperation)
 
     // Validate partition predicates
     val replaceWhere = options.replaceWhere

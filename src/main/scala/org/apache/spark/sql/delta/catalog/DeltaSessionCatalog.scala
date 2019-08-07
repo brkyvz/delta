@@ -21,6 +21,7 @@ import java.{util => ju}
 import java.util.Locale
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
@@ -33,16 +34,17 @@ import org.apache.spark.sql.catalog.v2.expressions.{FieldReference, IdentityTran
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.delta.DeltaOperations.QualifiedColTypeWithPositionForLog
-import org.apache.spark.sql.delta.{DeltaConfigs, DeltaErrors, DeltaLog, DeltaOperations, OptimisticTransaction}
-import org.apache.spark.sql.delta.actions.Metadata
+import org.apache.spark.sql.delta.{DeltaConfigs, DeltaErrors, DeltaLog, DeltaOperations, DeltaOptions, OptimisticTransaction}
+import org.apache.spark.sql.delta.actions.{Action, Metadata}
+import org.apache.spark.sql.delta.commands.WriteIntoDelta
 import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.{DeltaDataSource, DeltaDataSourceBase}
 import org.apache.spark.sql.delta.util.DeltaFileOperations
 import org.apache.spark.sql.execution.datasources.DataSource
 import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, SupportsV1Write, V2SessionCatalog}
 import org.apache.spark.sql.internal.SessionState
-import org.apache.spark.sql.sources.v2.writer.{V1WriteBuilder, WriteBuilder}
-import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider}
+import org.apache.spark.sql.sources.v2.writer.{SupportsOverwrite, SupportsTruncate, V1WriteBuilder, WriteBuilder}
+import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, Filter, InsertableRelation}
 import org.apache.spark.sql.sources.v2.{StagedTable, SupportsWrite, Table, TableCapability}
 import org.apache.spark.sql.types.{DataType, MetadataBuilder, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -265,14 +267,21 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       throw new IllegalArgumentException(s"Not a Delta table: $properties")
     }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
+    val sparkSession = SparkSession.active
     val location = getLocation(ident, properties)
+    assertPathEmpty(sparkSession, ident, new Path(location))
     val props = getMetaStoreProperties(properties)
     val commitOp = () => sessionState.catalog.createTable(
       createCatalogTable(ident, props.asScala.toMap),
       ignoreIfExists = false,
       validateLocation = false)
     StagedDeltaTable(
-      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = true)
+      DeltaLog.forTable(sparkSession, new Path(location)),
+      metadata.partitionColumns,
+      metadata.configuration,
+      DeltaOperations.CreateTable(metadata, properties.containsKey("location"), asSelect = true),
+      commitOp,
+      () => ())
   }
 
   override def stageReplace(
@@ -291,7 +300,13 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       ignoreIfExists = false,
       validateLocation = false)
     StagedDeltaTable(
-      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = false)
+      DeltaLog.forTable(SparkSession.active, new Path(location)),
+      metadata.partitionColumns,
+      metadata.configuration,
+      DeltaOperations.ReplaceTableAsSelect(
+        metadata, properties.containsKey("location"), orCreate = false),
+      commitOp,
+      () => ())
   }
 
   override def stageCreateOrReplace(
@@ -310,7 +325,13 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       ignoreIfExists = false,
       validateLocation = false)
     StagedDeltaTable(
-      SparkSession.active, location, metadata, commitOp, clearLocationIfFailed = false)
+      DeltaLog.forTable(SparkSession.active, new Path(location)),
+      metadata.partitionColumns,
+      metadata.configuration,
+      DeltaOperations.ReplaceTableAsSelect(
+        metadata, properties.containsKey("location"), orCreate = true),
+      commitOp,
+      () => ())
   }
 
   private def setupMetadata(
@@ -456,6 +477,9 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
 }
 
 trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrite {
+
+  protected lazy val spark: SparkSession = SparkSession.active
+
   private[catalog] val deltaLog: DeltaLog
 
   protected val metadata: Metadata
@@ -492,73 +516,100 @@ trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrit
     super.createRelation(
       sqlContext, mode, parameters + ("path" -> deltaLog.dataPath.toString), data)
   }
-
-  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder = {
-    new DeltaWriteBuilder(this)
-  }
-}
-
-class DeltaWriteBuilder(table: DeltaV2TableMixin) extends V1WriteBuilder {
-  override def buildForV1Write(): CreatableRelationProvider = table
 }
 
 case class DeltaTableV2(location: String) extends DeltaV2TableMixin {
 
-  private lazy val spark: SparkSession = SparkSession.active
-
   override private[catalog] val deltaLog: DeltaLog = DeltaLog.forTable(spark, location)
 
   override protected val metadata: Metadata = deltaLog.update().metadata
+
+  private class DeltaTableWriter(options: CaseInsensitiveStringMap)
+    extends V1WriteBuilder
+    with SupportsOverwrite
+    with SupportsTruncate {
+
+    private var mode = SaveMode.Append
+
+    override def truncate(): WriteBuilder = {
+      mode = SaveMode.Overwrite
+      this
+    }
+
+    override def overwrite(filters: Array[Filter]): WriteBuilder = {
+      mode = SaveMode.Overwrite
+      if (filters.nonEmpty && options.containsKey("replaceWhere")) {
+        throw new IllegalArgumentException(
+          "Please either use replaceWhere or the overwrite by expression statement.")
+      } else if (filters.nonEmpty) {
+        // TODO
+      }
+      this
+    }
+
+    override def buildForV1Write(): InsertableRelation = {
+      new InsertableRelation {
+        override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+          val session = data.sparkSession
+          val writer = WriteIntoDelta(
+            deltaLog,
+            mode,
+            new DeltaOptions(options.asScala.toMap, session.sessionState.conf),
+            metadata.partitionColumns,
+            Map.empty)
+          writer.run(session, data)
+        }
+      }
+    }
+  }
+
+  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder = {
+    new DeltaTableWriter(options)
+  }
 }
 
 case class StagedDeltaTable private (
     deltaLog: DeltaLog,
+    partitionColumns: Seq[String],
+    configuration: Map[String, String],
+    operation: DeltaOperations.Operation,
     commitOperation: () => Unit,
     abortOperation: () => Unit) extends StagedTable
   with DeltaV2TableMixin {
 
-  private lazy val spark: SparkSession = SparkSession.active
+  private val txn = deltaLog.startTransaction()
+  private val actions = new mutable.ArrayBuffer[Action]()
 
-  override protected val metadata: Metadata = OptimisticTransaction.getActive().get.metadata
+  override protected val metadata: Metadata = txn.metadata
+
+  override def newWriteBuilder(options: CaseInsensitiveStringMap): WriteBuilder = {
+    new DeltaTableCreationWriter(options)
+  }
 
   override def commitStagedChanges(): Unit = {
-    assert(OptimisticTransaction.getActive().isDefined)
-    OptimisticTransaction.clearActive()
+    txn.commit(actions, operation)
     commitOperation()
   }
 
   override def abortStagedChanges(): Unit = {
-    assert(OptimisticTransaction.getActive().isDefined)
-    OptimisticTransaction.clearActive()
     abortOperation()
   }
-}
 
-object StagedDeltaTable {
-  def apply(
-      spark: SparkSession,
-      location: URI,
-      metadata: Metadata,
-      commitOperation: () => Unit,
-      clearLocationIfFailed: Boolean): StagedDeltaTable = {
-    val deltaLog = DeltaLog.forTable(spark, new Path(location))
-    val txn = deltaLog.startTransaction()
-    assert(OptimisticTransaction.getActive().isEmpty, "There's already an active transaction!")
-    OptimisticTransaction.setActive(txn)
-    txn.updateMetadata(metadata)
-
-    def abort(): Unit = {
-      if (clearLocationIfFailed) {
-
+  private class DeltaTableCreationWriter(options: CaseInsensitiveStringMap) extends V1WriteBuilder {
+    override def buildForV1Write(): InsertableRelation = {
+      new InsertableRelation {
+        override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+          val session = data.sparkSession
+          val writer = WriteIntoDelta(
+            deltaLog,
+            SaveMode.Append,
+            new DeltaOptions(options.asScala.toMap, session.sessionState.conf),
+            partitionColumns,
+            configuration
+          )
+          actions ++= writer.write(txn, session, data)
+        }
       }
-    }
-
-    try {
-      new StagedDeltaTable(deltaLog, commitOperation, abort)
-    } catch {
-      case NonFatal(e) =>
-        OptimisticTransaction.clearActive()
-        throw e
     }
   }
 }

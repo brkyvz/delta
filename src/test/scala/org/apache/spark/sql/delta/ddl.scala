@@ -61,7 +61,6 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    OptimisticTransaction.clearActive()
     Try {
       spark.sessionState.catalog.listTables("default").foreach { ti =>
         spark.sessionState.catalog.dropTable(ti, ignoreIfNotExists = true, purge = true)

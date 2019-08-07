@@ -634,8 +634,7 @@ class DeltaLog private(
           mode = mode,
           new DeltaOptions(parameters, spark.sessionState.conf),
           partitionColumns = Seq.empty,
-          configuration = Map.empty,
-          data = data).run(spark)
+          configuration = Map.empty).run(spark, data = data)
       }
     }
   }

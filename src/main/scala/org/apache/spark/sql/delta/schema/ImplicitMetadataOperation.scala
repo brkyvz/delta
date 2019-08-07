@@ -29,8 +29,8 @@ import org.apache.spark.sql.types.StructType
  */
 trait ImplicitMetadataOperation extends DeltaLogging {
 
-  protected val canMergeSchema: Boolean
-  protected val canOverwriteSchema: Boolean
+  protected def canMergeSchema: Boolean
+  protected def canOverwriteSchema: Boolean
 
   private def normalizePartitionColumns(
       spark: SparkSession,
