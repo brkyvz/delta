@@ -357,6 +357,8 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSparkSession with B
         DeltaLog.forTable(spark, TableIdentifier("tahoe_test"))
       }
       val snapshot = deltaLog.update()
+      assert(snapshot.version === 0)
+      println(snapshot.metadata)
       assert(snapshot.metadata.configuration == Map(
         "delta.logRetentionDuration" -> "2 weeks",
         "delta.checkpointInterval" -> "20",

@@ -264,9 +264,10 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       schema: StructType,
       partitions: Array[Transform],
       properties: ju.Map[String, String]): StagedTable = {
-    if (!isDeltaTable(properties)) {
-      throw new IllegalArgumentException(s"Not a Delta table: $properties")
-    }
+    // TODO: Fix this in Spark
+//    if (!isDeltaTable(properties)) {
+//      throw new IllegalArgumentException(s"Not a Delta table: $properties")
+//    }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
     val sparkSession = SparkSession.active
     val location = getLocation(ident, properties)
@@ -290,9 +291,10 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       schema: StructType,
       partitions: Array[Transform],
       properties: ju.Map[String, String]): StagedTable = {
-    if (!isDeltaTable(properties)) {
-      throw new IllegalArgumentException(s"Not a Delta table: $properties")
-    }
+    // TODO: Fix this in Spark
+//    if (!isDeltaTable(properties)) {
+//      throw new IllegalArgumentException(s"Not a Delta table: $properties")
+//    }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
     val location = getLocation(ident, properties)
     val props = getMetaStoreProperties(properties)
@@ -315,9 +317,10 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
       schema: StructType,
       partitions: Array[Transform],
       properties: ju.Map[String, String]): StagedTable = {
-    if (!isDeltaTable(properties)) {
-      throw new IllegalArgumentException(s"Not a Delta table: $properties")
-    }
+    // TODO: Fix this in Spark
+//    if (!isDeltaTable(properties)) {
+//      throw new IllegalArgumentException(s"Not a Delta table: $properties")
+//    }
     val metadata = setupMetadata(ident, schema.asNullable, partitions, properties)
     val location = getLocation(ident, properties)
     val props = getMetaStoreProperties(properties)
@@ -349,6 +352,7 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
     val storageProps = Set("location", "comment", "provider")
     val tableProperties = properties.asScala.filterKeys(p => !storageProps.contains(p))
     val validatedConfigurations = DeltaConfigs.validateConfigurations(tableProperties.toMap)
+    println(validatedConfigurations)
 
     Metadata(
       name = ident.name(),
@@ -481,7 +485,7 @@ trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrit
 
   protected lazy val spark: SparkSession = SparkSession.active
 
-  private[catalog] val deltaLog: DeltaLog
+  val deltaLog: DeltaLog
 
   protected val metadata: Metadata
 
@@ -500,6 +504,9 @@ trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrit
 
   override def capabilities(): ju.Set[TableCapability] = new ju.HashSet[TableCapability](Set(
     TableCapability.BATCH_WRITE,
+    TableCapability.V1_BATCH_WRITE,
+    TableCapability.OVERWRITE_BY_FILTER,
+    TableCapability.TRUNCATE,
     TableCapability.ACCEPT_ANY_SCHEMA
   ).asJava)
 
@@ -521,7 +528,7 @@ trait DeltaV2TableMixin extends Table with DeltaDataSourceBase with SupportsWrit
 
 case class DeltaTableV2(location: String) extends DeltaV2TableMixin {
 
-  override private[catalog] val deltaLog: DeltaLog = DeltaLog.forTable(spark, location)
+  override val deltaLog: DeltaLog = DeltaLog.forTable(spark, location)
 
   override protected val metadata: Metadata = deltaLog.update().metadata
 

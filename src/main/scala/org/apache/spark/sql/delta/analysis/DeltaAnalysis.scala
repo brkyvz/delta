@@ -16,11 +16,16 @@
 
 package org.apache.spark.sql.delta.analysis
 
-import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.catalyst.expressions.{Alias, UpCast}
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, Project}
+import scala.collection.JavaConverters._
+
+import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Expression, Literal, UpCast}
+import org.apache.spark.sql.catalyst.planning.PhysicalOperation
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, Filter, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.delta.catalog.DeltaTableV2
+import org.apache.spark.sql.execution.datasources.LogicalRelation
+import org.apache.spark.sql.execution.{FilterExec, ProjectExec}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{DataType, StructType}
 import org.apache.spark.sql.util.SchemaUtils
@@ -48,6 +53,17 @@ case object DeltaAnalysis extends Rule[LogicalPlan] {
       } else {
         a
       }
+
+    case PhysicalOperation(projects, filters,
+        DataSourceV2Relation(d: DeltaTableV2, output, options)) =>
+      val relation = d.createRelation(
+        SparkSession.active.sqlContext,
+        options.asCaseSensitiveMap().asScala.toMap)
+      Project(projects,
+        Filter(filters.foldLeft(Literal(true).asInstanceOf[Expression])(And),
+          LogicalRelation(relation, output, None, isStreaming = false)
+        )
+      )
   }
 
   private def normalizeQueryColumns(query: LogicalPlan, target: DeltaTableV2): LogicalPlan = {

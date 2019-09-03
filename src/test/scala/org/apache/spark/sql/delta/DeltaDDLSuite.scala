@@ -76,13 +76,13 @@ class DeltaDDLSuite extends QueryTest with SharedSparkSession {
   ddlTest("ALTER TABLE SET TBLPROPERTIES") { tblName =>
     sql(s"""CREATE TABLE $tblName (id bigint) USING delta""")
     sql(s"""ALTER TABLE $tblName SET TBLPROPERTIES (delta.appendOnly = true)""")
-    val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
+    // val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
   }
 
   ddlTest("ALTER TABLE UNSET TBLPROPERTIES") { tblName =>
     sql(s"CREATE TABLE $tblName (id bigint) USING delta TBLPROPERTIES (delta.appendOnly = true)")
     sql(s"""ALTER TABLE $tblName UNSET TBLPROPERTIES (delta.appendOnly)""")
-    val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
+    // val deltaLog = DeltaLog.forTable(spark, TableIdentifier(tblName))
   }
 
   ddlTest("ALTER TABLE ADD COLUMN") { tblName =>
