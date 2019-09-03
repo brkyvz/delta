@@ -25,10 +25,10 @@ import org.apache.spark.sql.catalog.v2.Identifier
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.delta.catalog.DeltaSessionCatalog
-import org.apache.spark.sql.test.SharedSQLContext
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.util.Utils
 
-class DeltaDDLSuite extends QueryTest with SharedSQLContext {
+class DeltaDDLSuite extends QueryTest with SharedSparkSession {
 
   override def afterAll(): Unit = {
     val db = spark.sessionState.catalog.getCurrentDatabase

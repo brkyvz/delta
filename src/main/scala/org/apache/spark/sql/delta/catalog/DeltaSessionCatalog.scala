@@ -41,8 +41,9 @@ import org.apache.spark.sql.delta.schema.SchemaUtils
 import org.apache.spark.sql.delta.sources.{DeltaDataSource, DeltaDataSourceBase}
 import org.apache.spark.sql.delta.util.DeltaFileOperations
 import org.apache.spark.sql.execution.datasources.DataSource
-import org.apache.spark.sql.execution.datasources.v2.{CatalogTableAsV2, SupportsV1Write, V2SessionCatalog}
+import org.apache.spark.sql.execution.datasources.v2.{SupportsV1Write, V2SessionCatalog}
 import org.apache.spark.sql.internal.SessionState
+import org.apache.spark.sql.sources.v2.internal.UnresolvedTable
 import org.apache.spark.sql.sources.v2.writer.{SupportsOverwrite, SupportsTruncate, V1WriteBuilder, WriteBuilder}
 import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, Filter, InsertableRelation}
 import org.apache.spark.sql.sources.v2.{StagedTable, SupportsWrite, Table, TableCapability}
@@ -60,7 +61,7 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
     isDeltaTable(Option(properties.get("provider")))
   }
 
-  private def isDeltaTable(catalogTable: CatalogTableAsV2): Boolean = {
+  private def isDeltaTable(catalogTable: UnresolvedTable): Boolean = {
     isDeltaTable(catalogTable.v1Table.provider)
   }
 
@@ -69,7 +70,7 @@ class DeltaSessionCatalog(sessionState: SessionState) extends V2SessionCatalog(s
   }
 
   override def loadTable(ident: Identifier): Table = {
-    val catalogTable = super.loadTable(ident).asInstanceOf[CatalogTableAsV2]
+    val catalogTable = super.loadTable(ident).asInstanceOf[UnresolvedTable]
     if (isDeltaTable(catalogTable)) {
       return DeltaTableV2(new Path(catalogTable.v1Table.location).toString)
     }
@@ -525,7 +526,8 @@ case class DeltaTableV2(location: String) extends DeltaV2TableMixin {
   override protected val metadata: Metadata = deltaLog.update().metadata
 
   private class DeltaTableWriter(options: CaseInsensitiveStringMap)
-    extends V1WriteBuilder
+    extends WriteBuilder
+    with V1WriteBuilder
     with SupportsOverwrite
     with SupportsTruncate {
 
@@ -595,7 +597,9 @@ case class StagedDeltaTable private (
     abortOperation()
   }
 
-  private class DeltaTableCreationWriter(options: CaseInsensitiveStringMap) extends V1WriteBuilder {
+  private class DeltaTableCreationWriter(options: CaseInsensitiveStringMap)
+    extends WriteBuilder
+    with V1WriteBuilder {
     override def buildForV1Write(): InsertableRelation = {
       new InsertableRelation {
         override def insert(data: DataFrame, overwrite: Boolean): Unit = {

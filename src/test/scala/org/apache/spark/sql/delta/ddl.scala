@@ -44,13 +44,13 @@ import org.apache.spark.sql.delta.schema.InvariantViolationException
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.sources.v2.Table
-import org.apache.spark.sql.test.{SQLTestUtils, SharedSQLContext, TestSparkSession}
+import org.apache.spark.sql.test.{SQLTestUtils, SharedSparkSession, TestSparkSession}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
 class DeltaDDLSuite2 extends DeltaDDLTestBase
 
-abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with BeforeAndAfter {
+abstract class DeltaDDLTestBase extends QueryTest with SharedSparkSession with BeforeAndAfter {
 
   override def sparkConf: SparkConf = {
     super.sparkConf
@@ -83,7 +83,7 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
   private def disableSparkService[A](f: => A): A = f
 
   private def getSessionCatalog: TableCatalog = {
-    spark.catalog("session").asInstanceOf[TableCatalog]
+    spark.sessionState.catalogManager.catalog("session").asInstanceOf[TableCatalog]
   }
 
   private def getExternalCatalog = spark.sessionState.catalog.externalCatalog
@@ -183,7 +183,7 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
   */
 
   test("create and drop tahoe table - external") {
-    val catalog = spark.catalog("session").asInstanceOf[TableCatalog]
+    val catalog = getSessionCatalog
     withTempDir { tempDir =>
       withTable("tahoe_test") {
         sql("CREATE TABLE tahoe_test(a LONG, b String) USING delta " +
@@ -300,7 +300,6 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
         checkAnswer(spark.table("tab1"), Row(2, "b"))
       }
     } finally {
-      waitForTasksToFinish()
       Utils.deleteRecursively(tableLoc)
     }
   }
@@ -315,7 +314,6 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
         checkAnswer(spark.table("tab1"), Row(2, "B"))
       }
     } finally {
-      waitForTasksToFinish()
       Utils.deleteRecursively(tableLoc)
     }
   }
@@ -338,7 +336,6 @@ abstract class DeltaDDLTestBase extends QueryTest with SharedSQLContext with Bef
         }.getMessage
         assert(ex.contains("Cannot create table"))
       } finally {
-        waitForTasksToFinish()
         Utils.deleteRecursively(tableLoc)
       }
     }
